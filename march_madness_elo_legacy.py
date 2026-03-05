@@ -2,15 +2,15 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║          🏀 MARCH MADNESS ELO BRACKET PREDICTOR — ALL 3 MODELS             ║
 ║                                                                              ║
-║  V1 — Basic ELO      : wins/losses only (no SOS)                           ║
-║  V2 — Enhanced ELO   : MOV + home court + recency + rolling SOS            ║
-║  V3 — Kitchen Sink   : V2 + conference strength + seed prior + rolling SOS ║
+║  V1 — Basic ELO      : wins/losses only                                     ║
+║  V2 — Enhanced ELO   : + margin of victory, home court, recency weighting  ║
+║  V3 — Kitchen Sink   : + conference strength, seed prior blending           ║
 ║                                                                              ║
 ║  RATING APPROACH:                                                            ║
 ║    - 2010-2024: historical calibration (shapes K, reversion behavior)       ║
-║    - 2025 only: hard reset + clean pass on current season                   ║
-║    - SOS uses rolling current-season opponent win rates with Bayesian       ║
-║      shrinkage toward 0.5 — avoids prior season data entirely               ║
+║    - 2025 only: final ratings reset + clean pass on current season          ║
+║    - Aggressive reversion (0.4) between seasons accounts for roster         ║
+║      turnover — UConn's 2023-24 dominance won't pollute 2025 ratings       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -29,55 +29,21 @@ warnings.filterwarnings("ignore")
 
 # ── Season Config ─────────────────────────────────────────────────────────────
 PREDICT_YEAR      = 2025
-CALIBRATION_START = 2010
-CALIBRATION_END   = 2024
-CURRENT_SEASON    = 2025
+CALIBRATION_START = 2010   # Historical seasons used to shape model behavior
+CALIBRATION_END   = 2024   # Last historical season (inclusive)
+CURRENT_SEASON    = 2025   # Season used for final ratings
 
 # ── ELO Tuning Parameters ─────────────────────────────────────────────────────
 STARTING_ELO       = 1500
 K_FACTOR           = 20      # V1 base K
 K_FACTOR_ENHANCED  = 24      # V2/V3 base K
 HOME_ADVANTAGE     = 100
-REVERSION_FACTOR   = 0.40    # Aggressive reversion for roster turnover
+REVERSION_FACTOR   = 0.40    # Aggressive reversion for college basketball roster turnover
+                              # (was 0.75 — lowered to discount prior season dominance)
 RECENCY_HALF_LIFE  = 30      # Days within a season
-SEED_PRIOR_WEIGHT  = 0.00    # V3: seed prior disabled — pure ELO signal
-                              # Sweep showed 0.0 gives 35.6% upset detection vs 22% at 0.15
-                              # Trades ~3% overall accuracy for meaningful upset prediction
+SEED_PRIOR_WEIGHT  = 0.15    # V3: blend toward seed-implied ELO
 CONF_STRENGTH_W    = 0.10    # V3: conference adjustment scaling
 N_SIMULATIONS      = 10_000
-
-# ── Strength of Schedule (SOS) — V2 and V3 only ──────────────────────────────
-# Rolling current-season opponent win rates with Bayesian shrinkage toward 0.5.
-# Applied only during the 2025 season pass — calibration is unaffected.
-#
-# Math:
-#   sos_weight    = games_played / (games_played + SOS_SHRINKAGE)
-#   sos_estimate  = sos_weight * actual_win_rate + (1 - sos_weight) * 0.50
-#   sos_rel       = sos_estimate / league_avg_sos          (relative to field)
-#   sos_mult      = 1.0 + SOS_IMPACT * (sos_rel - 1.0)    (scale around 1.0)
-#   sos_mult      = clamp(sos_mult, SOS_MIN_MULT, SOS_MAX_MULT)
-#
-SOS_SHRINKAGE      = 10      # Games for ~50% confidence in opponent SOS estimate
-                              # Lower = trust SOS sooner | Higher = more shrinkage early
-SOS_IMPACT         = 0.30    # In-game K shift from SOS — kept mild, post-processing does heavy lifting
-SOS_MIN_MULTIPLIER = 0.75    # K floor for in-game multiplier
-SOS_MAX_MULTIPLIER = 1.25    # K ceiling for in-game multiplier
-
-# ── SOS Post-Processing (direct ELO adjustment after training) ────────────────
-# After training, apply a direct ELO bonus/penalty based on how a team's SOS
-# compares to the field average, normalized by standard deviation (z-score).
-# This directly taxes mid-majors with weak schedules and rewards power conf teams.
-#
-# Math:
-#   sos_z   = (team_sos - mean_sos) / std_sos      (z-score vs field)
-#   adj     = sos_z * SOS_SCALE                     (convert to ELO points)
-#   new_elo = trained_elo + adj
-#
-# At SOS_SCALE=40: a team 1 std dev above avg SOS gets +40 ELO, 1 below gets -40
-# Auburn (~62% SOS) vs UC San Diego (~48% SOS): expect ~2 std dev gap → ~80 pt diff
-#
-SOS_SCALE          = 40      # ELO points per SOS standard deviation
-                              # Tune this: higher = more punishment for weak schedules
 
 # Seed → implied ELO prior
 SEED_ELO_MAP = {
@@ -195,125 +161,27 @@ def games_for_seasons(reg_df, tourney_df, seasons):
     return pd.concat([reg, trn]).sort_values(["Season", "DayNum"]).reset_index(drop=True)
 
 def games_for_season_reg_only(reg_df, season):
+    """Current season: regular season only (no tourney results yet)."""
     cols = ["Season", "DayNum", "WTeamID", "LTeamID", "WScore", "LScore", "WLoc"]
     return reg_df[reg_df["Season"] == season][cols].sort_values("DayNum").reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4: Rolling SOS Helper
-# ══════════════════════════════════════════════════════════════════════════════
-
-class RollingSOS:
-    """
-    Tracks each team's current-season win/loss record as games are processed
-    in chronological order. Used to compute opponent strength at the moment
-    of each game without any lookahead bias.
-
-    For each game update, call sos_multiplier(opponent_id) BEFORE recording
-    the game result, so we're using the opponent's record up to but not
-    including this game.
-    """
-
-    def __init__(self):
-        self.wins   = defaultdict(int)
-        self.losses = defaultdict(int)
-        self._league_avg_cache = None
-        self._games_played_total = 0
-        self._opponents_faced = defaultdict(list)  # team_id -> [opponent_ids]
-
-    def record_result(self, winner_id, loser_id):
-        """Call AFTER computing the SOS multiplier for this game."""
-        self.wins[winner_id]   += 1
-        self.losses[loser_id]  += 1
-        self._league_avg_cache  = None   # invalidate cache
-        self._games_played_total += 1
-        # Track opponents faced for avg opponent strength calculation
-        self._opponents_faced[winner_id].append(loser_id)
-        self._opponents_faced[loser_id].append(winner_id)
-
-    def _shrunk_win_rate(self, team_id):
-        """
-        Bayesian shrinkage: blend observed win rate toward 0.5 based on
-        how many games the team has played.
-
-        sos_weight   = n / (n + shrinkage)
-        sos_estimate = sos_weight * win_rate + (1 - sos_weight) * 0.5
-
-        Respects self._shrinkage_override if set (used by parameter sweep).
-        """
-        w = self.wins[team_id]
-        l = self.losses[team_id]
-        n = w + l
-        if n == 0:
-            return 0.5   # no data → assume average
-        shrinkage  = getattr(self, "_shrinkage_override", SOS_SHRINKAGE)
-        win_rate   = w / n
-        sos_weight = n / (n + shrinkage)
-        return sos_weight * win_rate + (1 - sos_weight) * 0.5
-
-    def _league_avg(self):
-        """
-        Average shrunk win rate across all teams seen so far.
-        Cached until a new game is recorded.
-        Stays close to 0.5 by construction (shrinkage toward 0.5).
-        """
-        if self._league_avg_cache is not None:
-            return self._league_avg_cache
-        all_teams = set(self.wins.keys()) | set(self.losses.keys())
-        if not all_teams:
-            return 0.5
-        avg = np.mean([self._shrunk_win_rate(t) for t in all_teams])
-        self._league_avg_cache = avg
-        return avg
-
-    def sos_multiplier(self, opponent_id):
-        """
-        Return a K scaling factor in [SOS_MIN_MULTIPLIER, SOS_MAX_MULTIPLIER]
-        based on how strong the opponent is relative to the current field average.
-
-        > 1.0 → opponent is above average → win counts more
-        < 1.0 → opponent is below average → win counts less
-        = 1.0 → opponent is exactly average
-        """
-        opp_sos  = self._shrunk_win_rate(opponent_id)
-        avg_sos  = self._league_avg()
-
-        # Scale relative to league average, weighted by SOS_IMPACT
-        if avg_sos == 0:
-            return 1.0
-        sos_rel  = opp_sos / avg_sos
-        raw_mult = 1.0 + SOS_IMPACT * (sos_rel - 1.0)
-        return float(np.clip(raw_mult, SOS_MIN_MULTIPLIER, SOS_MAX_MULTIPLIER))
-
-    def avg_opponent_strength(self, team_id):
-        """
-        Average shrunk win rate of all opponents this team faced.
-        This is the true SOS metric: how good were the teams they played?
-        Higher = harder schedule.
-        """
-        opps = self._opponents_faced[team_id]
-        if not opps:
-            return 50.0
-        return np.mean([self._shrunk_win_rate(o) for o in opps]) * 100
-
-    def final_sos_scores(self):
-        """
-        Return {team_id: avg_opponent_strength_pct} for all teams.
-        This is AVERAGE OPPONENT WIN RATE — the true schedule difficulty metric.
-        e.g. 58.3% means this team's opponents won 58.3% of their games on avg.
-        UC San Diego playing weak mid-majors will score ~47%, Auburn playing
-        SEC opponents will score ~64%.
-        """
-        all_teams = set(self.wins.keys()) | set(self.losses.keys())
-        return {t: round(self.avg_opponent_strength(t), 1) for t in all_teams}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5: ELO Update Rules & Two-Phase Training
+# SECTION 4: Two-Phase Training
+#
+#   Phase 1 — Calibration (2010-2024):
+#     Runs full ELO updates across historical seasons with season-end reversion.
+#     This teaches the model the right K/reversion behavior but we DON'T use
+#     these ratings directly — they're just a warm start.
+#
+#   Phase 2 — Current Season (2025):
+#     After calibration, HARD RESET all teams to mean (reversion=0), then run
+#     a clean pass on 2025 regular season only. This ensures final ratings
+#     reflect only this year's performance, not UConn's 2023-24 dynasty.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_elo_pass(games, elos, update_fn):
-    """Generic calibration pass with automatic season-boundary reversion."""
+    """Generic ELO pass with automatic season-boundary reversion."""
     cur_season = None
     for _, g in games.iterrows():
         if g["Season"] != cur_season:
@@ -329,39 +197,32 @@ def _run_elo_pass(games, elos, update_fn):
 
 
 def _hard_reset(elos):
-    """Full reversion to STARTING_ELO for all known teams."""
+    """Full reversion to mean — wipes historical carry-over before current season pass."""
     return defaultdict(lambda: STARTING_ELO,
                        {tid: STARTING_ELO for tid in elos})
 
 
-# ── V1: Basic (no SOS) ────────────────────────────────────────────────────────
+# ── Update rules ──────────────────────────────────────────────────────────────
+
 def _basic_update(g, elos, k=K_FACTOR):
     w, l = int(g["WTeamID"]), int(g["LTeamID"])
     ew = expected_score(elos[w], elos[l])
     return k * (1 - ew), k * (0 - (1 - ew))
 
 
-# ── V2: Enhanced (with SOS) ───────────────────────────────────────────────────
-def _enhanced_update(g, elos, k=K_FACTOR_ENHANCED, sos=None):
+def _enhanced_update(g, elos, k=K_FACTOR_ENHANCED):
     w, l = int(g["WTeamID"]), int(g["LTeamID"])
     loc  = g.get("WLoc", "N")
     home = HOME_ADVANTAGE if loc == "H" else (-HOME_ADVANTAGE if loc == "A" else 0)
     ew   = expected_score(elos[w] + home, elos[l])
     mult = mov_multiplier(g["WScore"] - g["LScore"], elos[w] - elos[l])
     rw   = recency_weight(g["DayNum"])
-
-    # SOS scaling: look up both opponents' strength before recording result
-    sos_w = sos.sos_multiplier(l) if sos else 1.0   # winner beat this opponent
-    sos_l = sos.sos_multiplier(w) if sos else 1.0   # loser lost to this opponent
-
-    upd_w = k * mult * rw * sos_w * (1 - ew)
-    upd_l = k * mult * rw * sos_l * (1 - ew)
-    return upd_w, -upd_l
+    upd  = k * mult * rw * (1 - ew)
+    return upd, -upd
 
 
-# ── V3: Kitchen Sink (with SOS) ───────────────────────────────────────────────
 def _make_kitchen_sink_update(conf_adj):
-    def _update(g, elos, k=K_FACTOR_ENHANCED, sos=None):
+    def _update(g, elos, k=K_FACTOR_ENHANCED):
         w, l = int(g["WTeamID"]), int(g["LTeamID"])
         loc  = g.get("WLoc", "N")
         wc   = conf_adj.get(w, 0) * CONF_STRENGTH_W
@@ -370,13 +231,8 @@ def _make_kitchen_sink_update(conf_adj):
         ew   = expected_score(elos[w] + home + wc, elos[l] + lc)
         mult = mov_multiplier(g["WScore"] - g["LScore"], elos[w] - elos[l])
         rw   = recency_weight(g["DayNum"])
-
-        sos_w = sos.sos_multiplier(l) if sos else 1.0
-        sos_l = sos.sos_multiplier(w) if sos else 1.0
-
-        upd_w = k * mult * rw * sos_w * (1 - ew)
-        upd_l = k * mult * rw * sos_l * (1 - ew)
-        return upd_w, -upd_l
+        upd  = k * mult * rw * (1 - ew)
+        return upd, -upd
     return _update
 
 
@@ -390,58 +246,6 @@ def build_conf_adjustments(conf_df, season):
         strength = next((v for k, v in CONF_STRENGTH.items() if k in abbrev or abbrev in k), 0)
         result[int(row["TeamID"])] = strength
     return result
-
-
-def apply_sos_adjustment(elos, sos_scores, tourney_team_ids=None):
-    """
-    Post-processing SOS adjustment: directly shift each team's ELO based on
-    how their schedule difficulty compares to the tournament field average,
-    measured in std devs (z-score).
-
-    IMPORTANT: z-score is computed only across tournament teams, not all 364
-    teams. This prevents SEC teams (extreme high-SOS outliers vs mid-majors)
-    from getting inflated bonuses — we care about SOS relative to other
-    tournament-caliber teams, not relative to Alabama State.
-
-    Teams with harder-than-average schedules get an ELO bonus.
-    Teams with easier-than-average schedules get an ELO penalty.
-
-    Args:
-        elos:             {team_id: elo} dict from training
-        sos_scores:       {team_id: avg_opponent_win_rate_pct} from RollingSOS
-        tourney_team_ids: list of team IDs in the tournament (used for normalization)
-
-    Returns:
-        adjusted {team_id: elo} dict
-    """
-    if not sos_scores:
-        return elos   # V1 — no SOS, return unchanged
-
-    # Normalize using tournament teams only if provided, else all teams with SOS
-    if tourney_team_ids:
-        norm_teams = [t for t in tourney_team_ids if t in sos_scores]
-    else:
-        norm_teams = [t for t in elos if t in sos_scores]
-
-    if len(norm_teams) < 2:
-        return elos
-
-    sos_vals = np.array([sos_scores[t] for t in norm_teams])
-    sos_mean = sos_vals.mean()
-    sos_std  = sos_vals.std()
-
-    if sos_std == 0:
-        return elos
-
-    # Apply adjustment to all teams that have SOS data
-    common_teams = [t for t in elos if t in sos_scores]
-    adjusted = dict(elos)
-    for tid in common_teams:
-        sos_z         = (sos_scores[tid] - sos_mean) / sos_std
-        adjustment    = sos_z * SOS_SCALE
-        adjusted[tid] = elos[tid] + adjustment
-
-    return adjusted
 
 
 def blend_seed_prior(elos, seeds_df, season, weight=SEED_PRIOR_WEIGHT):
@@ -459,16 +263,18 @@ def blend_seed_prior(elos, seeds_df, season, weight=SEED_PRIOR_WEIGHT):
     return blended
 
 
-# ── Two-phase training ────────────────────────────────────────────────────────
+# ── Two-phase training functions ──────────────────────────────────────────────
 
 def train_basic_elo(reg_df, tourney_df):
-    """V1: no SOS. Calibrate 2010-2024, hard reset, run 2025."""
+    """V1 two-phase: calibrate on 2010-2024, hard reset, run 2025 only."""
     cal_seasons = list(range(CALIBRATION_START, CALIBRATION_END + 1))
     elos = defaultdict(lambda: STARTING_ELO)
 
+    # Phase 1: calibration
     cal_games = games_for_seasons(reg_df, tourney_df, cal_seasons)
     elos = _run_elo_pass(cal_games, elos, _basic_update)
 
+    # Phase 2: hard reset → 2025 regular season only
     elos = _hard_reset(elos)
     cur_games = games_for_season_reg_only(reg_df, CURRENT_SEASON)
     for _, g in cur_games.iterrows():
@@ -476,40 +282,35 @@ def train_basic_elo(reg_df, tourney_df):
         elos[int(g["WTeamID"])] += w_delta
         elos[int(g["LTeamID"])] += l_delta
 
-    return dict(elos), {}   # no SOS scores for V1
+    return dict(elos)
 
 
 def train_enhanced_elo(reg_df, tourney_df):
-    """V2: calibrate 2010-2024, hard reset, run 2025 with rolling SOS."""
-    cal_seasons = list(range(CALIBRATION_START, CALIBRATION_END + 1))
-    elos = defaultdict(lambda: STARTING_ELO)
-
-    # Phase 1: calibration — no SOS (historical data, not meaningful here)
-    cal_games = games_for_seasons(reg_df, tourney_df, cal_seasons)
-    elos = _run_elo_pass(cal_games, elos, _enhanced_update)
-
-    # Phase 2: 2025 with rolling SOS
-    elos = _hard_reset(elos)
-    sos  = RollingSOS()
-    cur_games = games_for_season_reg_only(reg_df, CURRENT_SEASON)
-
-    for _, g in cur_games.iterrows():
-        # Compute SOS multiplier BEFORE recording this game's result
-        w_delta, l_delta = _enhanced_update(g, elos, sos=sos)
-        elos[int(g["WTeamID"])] += w_delta
-        elos[int(g["LTeamID"])] += l_delta
-        # Record result AFTER update so this game doesn't influence its own SOS
-        sos.record_result(int(g["WTeamID"]), int(g["LTeamID"]))
-
-    return dict(elos), sos.final_sos_scores()
-
-
-def train_kitchen_sink_elo(reg_df, tourney_df, conf_df):
-    """V3: calibrate 2010-2024, hard reset, run 2025 with rolling SOS + conf."""
+    """V2 two-phase: calibrate on 2010-2024, hard reset, run 2025 only."""
     cal_seasons = list(range(CALIBRATION_START, CALIBRATION_END + 1))
     elos = defaultdict(lambda: STARTING_ELO)
 
     # Phase 1: calibration
+    cal_games = games_for_seasons(reg_df, tourney_df, cal_seasons)
+    elos = _run_elo_pass(cal_games, elos, _enhanced_update)
+
+    # Phase 2: hard reset → 2025 regular season only
+    elos = _hard_reset(elos)
+    cur_games = games_for_season_reg_only(reg_df, CURRENT_SEASON)
+    for _, g in cur_games.iterrows():
+        w_delta, l_delta = _enhanced_update(g, elos)
+        elos[int(g["WTeamID"])] += w_delta
+        elos[int(g["LTeamID"])] += l_delta
+
+    return dict(elos)
+
+
+def train_kitchen_sink_elo(reg_df, tourney_df, conf_df):
+    """V3 two-phase: calibrate on 2010-2024, hard reset, run 2025 with conf + seed blend."""
+    cal_seasons = list(range(CALIBRATION_START, CALIBRATION_END + 1))
+    elos = defaultdict(lambda: STARTING_ELO)
+
+    # Phase 1: calibration with per-season conference adjustments
     cal_games = games_for_seasons(reg_df, tourney_df, cal_seasons)
     cur_season_cal, conf_adj = None, {}
     for _, g in cal_games.iterrows():
@@ -524,24 +325,21 @@ def train_kitchen_sink_elo(reg_df, tourney_df, conf_df):
         elos[int(g["WTeamID"])] += w_delta
         elos[int(g["LTeamID"])] += l_delta
 
-    # Phase 2: 2025 with rolling SOS + conf
+    # Phase 2: hard reset → 2025 regular season only
     elos = _hard_reset(elos)
-    sos  = RollingSOS()
-    conf_adj_2025  = build_conf_adjustments(conf_df, CURRENT_SEASON)
+    conf_adj_2025 = build_conf_adjustments(conf_df, CURRENT_SEASON)
     update_fn_2025 = _make_kitchen_sink_update(conf_adj_2025)
     cur_games = games_for_season_reg_only(reg_df, CURRENT_SEASON)
-
     for _, g in cur_games.iterrows():
-        w_delta, l_delta = update_fn_2025(g, elos, sos=sos)
+        w_delta, l_delta = update_fn_2025(g, elos)
         elos[int(g["WTeamID"])] += w_delta
         elos[int(g["LTeamID"])] += l_delta
-        sos.record_result(int(g["WTeamID"]), int(g["LTeamID"]))
 
-    return dict(elos), sos.final_sos_scores()
+    return dict(elos)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6: Bracket Simulation Engine
+# SECTION 5: Bracket Simulation Engine
 # ══════════════════════════════════════════════════════════════════════════════
 
 SEED_ORDER  = [1, 16, 8, 9, 5, 12, 4, 13, 6, 11, 3, 14, 7, 10, 2, 15]
@@ -615,7 +413,7 @@ def run_monte_carlo(bracket, elos, n=N_SIMULATIONS):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7: Printable Bracket Visualization
+# SECTION 6: Printable Bracket Visualization
 # ══════════════════════════════════════════════════════════════════════════════
 
 def draw_bracket(bracket, elos, results, id_to_name, model_name, color, filename):
@@ -714,12 +512,12 @@ def draw_bracket(bracket, elos, results, id_to_name, model_name, color, filename
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8: Comparison Charts
+# SECTION 7: Comparison Charts
 # ══════════════════════════════════════════════════════════════════════════════
 
 def plot_championship_probs(mc_results, id_to_name, models_config, n=N_SIMULATIONS):
     all_teams = set()
-    for name, _, _, _ in models_config:
+    for name, _, _ in models_config:
         top = sorted(mc_results[name]["champion_counts"].items(), key=lambda x: -x[1])[:15]
         all_teams.update(t for t, _ in top)
 
@@ -732,7 +530,7 @@ def plot_championship_probs(mc_results, id_to_name, models_config, n=N_SIMULATIO
     w = 0.27
 
     fig, ax = plt.subplots(figsize=(16, 6))
-    for i, (name, _, color, _) in enumerate(models_config):
+    for i, (name, _, color) in enumerate(models_config):
         probs = [mc_results[name]["champion_counts"].get(t, 0) / n * 100 for t in teams_sorted]
         ax.bar(x + i * w - w, probs, w, label=name, color=color, alpha=0.85,
                edgecolor="white", linewidth=0.5)
@@ -758,7 +556,7 @@ def plot_championship_probs(mc_results, id_to_name, models_config, n=N_SIMULATIO
 
 def plot_elo_distributions(tourney_teams, elo_list, models_config):
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-    for ax, (name, _, color, _), elos in zip(axes, models_config, elo_list):
+    for ax, (name, _, color), elos in zip(axes, models_config, elo_list):
         vals = [elos.get(t, STARTING_ELO) for t in tourney_teams]
         ax.hist(vals, bins=20, color=color, alpha=0.8, edgecolor="white")
         ax.axvline(np.mean(vals), color="red", linestyle="--", linewidth=1.5,
@@ -807,187 +605,23 @@ def plot_model_correlation(tourney_teams, elos_v1, elos_v2, elos_v3):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9: CSV Bracket Export
-# ══════════════════════════════════════════════════════════════════════════════
-
-ROUND_NAMES = {
-    1: "First Round", 2: "Second Round", 3: "Sweet 16",
-    4: "Elite 8",     5: "Final Four",   6: "Championship",
-}
-
-
-def _seed_for_team(team_id, seed_to_team):
-    return next((s for s, t in seed_to_team.items() if t == team_id), "?")
-
-
-def export_bracket_csv(bracket, elos, id_to_name, model_name,
-                       mc_result, sos_scores, filename, n=N_SIMULATIONS):
-    """
-    Simulate full bracket deterministically and write every matchup to CSV.
-    Includes ELO, win probabilities, Monte Carlo champion/FF pcts, and SOS score.
-    """
-    rows = []
-    champ_counts = mc_result["champion_counts"]
-    ff_counts    = mc_result["final_four_counts"]
-
-    # Build global seed lookup across all regions
-    all_seeds = {}
-    for region, region_teams in bracket.items():
-        for s, t in region_teams:
-            all_seeds[t] = s
-
-    # ── Regional rounds 1-4 ───────────────────────────────────────────────────
-    for region, region_teams in sorted(bracket.items()):
-        region_full  = REGION_FULL.get(region, region)
-        seed_to_team = {s: t for s, t in region_teams}
-        pairs        = first_round_pairs(region_teams)
-        current_matchups = pairs
-        round_num = 1
-
-        while current_matchups and round_num <= 4:
-            next_winners = []
-            for matchup_num, (team_a, team_b) in enumerate(current_matchups, 1):
-                ea    = elos.get(team_a, STARTING_ELO)
-                eb    = elos.get(team_b, STARTING_ELO)
-                p_a   = expected_score(ea, eb)
-                p_b   = 1 - p_a
-                winner = team_a if p_a >= 0.5 else team_b
-
-                rows.append({
-                    "round":                 round_num,
-                    "round_name":            ROUND_NAMES[round_num],
-                    "region":                region_full,
-                    "matchup_num":           matchup_num,
-                    "team_a":                id_to_name.get(team_a, str(team_a)),
-                    "seed_a":                _seed_for_team(team_a, seed_to_team),
-                    "elo_a":                 round(ea, 1),
-                    "sos_score_a":           sos_scores.get(team_a, "N/A"),
-                    "win_prob_a":            round(p_a * 100, 1),
-                    "team_b":                id_to_name.get(team_b, str(team_b)),
-                    "seed_b":                _seed_for_team(team_b, seed_to_team),
-                    "elo_b":                 round(eb, 1),
-                    "sos_score_b":           sos_scores.get(team_b, "N/A"),
-                    "win_prob_b":            round(p_b * 100, 1),
-                    "predicted_winner":      id_to_name.get(winner, str(winner)),
-                    "predicted_winner_seed": _seed_for_team(winner, seed_to_team),
-                    "mc_champion_pct":       round(champ_counts.get(winner, 0) / n * 100, 1),
-                    "mc_final_four_pct":     round(ff_counts.get(winner, 0) / n * 100, 1),
-                })
-                next_winners.append(winner)
-
-            current_matchups = [(next_winners[i], next_winners[i + 1])
-                                for i in range(0, len(next_winners) - 1, 2)]
-            round_num += 1
-
-    # ── Resolve region champs for Final Four ──────────────────────────────────
-    reg_champs = {}
-    for region, region_teams in sorted(bracket.items()):
-        pairs = first_round_pairs(region_teams)
-        winners = [sim_game(a, b, elos, deterministic=True) for a, b in pairs]
-        while len(winners) > 1:
-            winners = [sim_game(winners[i], winners[i + 1], elos, deterministic=True)
-                       for i in range(0, len(winners) - 1, 2)]
-        reg_champs[region] = winners[0]
-
-    regions = sorted(reg_champs)
-
-    def _ff_row(team_a, team_b, matchup_num, region_label):
-        ea  = elos.get(team_a, STARTING_ELO)
-        eb  = elos.get(team_b, STARTING_ELO)
-        p_a = expected_score(ea, eb)
-        p_b = 1 - p_a
-        winner = team_a if p_a >= 0.5 else team_b
-        return {
-            "round":                 5,
-            "round_name":            "Final Four",
-            "region":                region_label,
-            "matchup_num":           matchup_num,
-            "team_a":                id_to_name.get(team_a, str(team_a)),
-            "seed_a":                all_seeds.get(team_a, "?"),
-            "elo_a":                 round(ea, 1),
-            "sos_score_a":           sos_scores.get(team_a, "N/A"),
-            "win_prob_a":            round(p_a * 100, 1),
-            "team_b":                id_to_name.get(team_b, str(team_b)),
-            "seed_b":                all_seeds.get(team_b, "?"),
-            "elo_b":                 round(eb, 1),
-            "sos_score_b":           sos_scores.get(team_b, "N/A"),
-            "win_prob_b":            round(p_b * 100, 1),
-            "predicted_winner":      id_to_name.get(winner, str(winner)),
-            "predicted_winner_seed": all_seeds.get(winner, "?"),
-            "mc_champion_pct":       round(champ_counts.get(winner, 0) / n * 100, 1),
-            "mc_final_four_pct":     round(ff_counts.get(winner, 0) / n * 100, 1),
-        }, winner
-
-    sf1_row, sf1_winner = _ff_row(
-        reg_champs[regions[0]], reg_champs[regions[1]], 1,
-        f"{REGION_FULL.get(regions[0], regions[0])} vs {REGION_FULL.get(regions[1], regions[1])}",
-    )
-    sf2_row, sf2_winner = _ff_row(
-        reg_champs[regions[2]], reg_champs[regions[3]], 2,
-        f"{REGION_FULL.get(regions[2], regions[2])} vs {REGION_FULL.get(regions[3], regions[3])}",
-    )
-    rows.extend([sf1_row, sf2_row])
-
-    # ── Championship ──────────────────────────────────────────────────────────
-    ea  = elos.get(sf1_winner, STARTING_ELO)
-    eb  = elos.get(sf2_winner, STARTING_ELO)
-    p_a = expected_score(ea, eb)
-    p_b = 1 - p_a
-    champion = sf1_winner if p_a >= 0.5 else sf2_winner
-
-    rows.append({
-        "round":                 6,
-        "round_name":            "Championship",
-        "region":                "National",
-        "matchup_num":           1,
-        "team_a":                id_to_name.get(sf1_winner, str(sf1_winner)),
-        "seed_a":                all_seeds.get(sf1_winner, "?"),
-        "elo_a":                 round(ea, 1),
-        "sos_score_a":           sos_scores.get(sf1_winner, "N/A"),
-        "win_prob_a":            round(p_a * 100, 1),
-        "team_b":                id_to_name.get(sf2_winner, str(sf2_winner)),
-        "seed_b":                all_seeds.get(sf2_winner, "?"),
-        "elo_b":                 round(eb, 1),
-        "sos_score_b":           sos_scores.get(sf2_winner, "N/A"),
-        "win_prob_b":            round(p_b * 100, 1),
-        "predicted_winner":      id_to_name.get(champion, str(champion)),
-        "predicted_winner_seed": all_seeds.get(champion, "?"),
-        "mc_champion_pct":       round(champ_counts.get(champion, 0) / n * 100, 1),
-        "mc_final_four_pct":     round(ff_counts.get(champion, 0) / n * 100, 1),
-    })
-
-    # ── Write CSV ─────────────────────────────────────────────────────────────
-    cols = [
-        "round", "round_name", "region", "matchup_num",
-        "team_a", "seed_a", "elo_a", "sos_score_a", "win_prob_a",
-        "team_b", "seed_b", "elo_b", "sos_score_b", "win_prob_b",
-        "predicted_winner", "predicted_winner_seed",
-        "mc_champion_pct", "mc_final_four_pct",
-    ]
-    df = pd.DataFrame(rows, columns=cols)
-    df.to_csv(filename, index=False)
-    print(f"  Saved: {filename}  ({len(df)} matchups)")
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 10: Results Summary Table
+# SECTION 8: Results Summary Table
 # ══════════════════════════════════════════════════════════════════════════════
 
 def print_summary_table(mc_results, id_to_name, models_config, n=N_SIMULATIONS):
-    names = [name for name, _, _, _ in models_config]
+    names = [name for name, _, _ in models_config]
     w = 70
 
     for label, count_key in [("FINAL FOUR PROBABILITY", "final_four_counts"),
                               ("CHAMPIONSHIP PROBABILITY", "champion_counts")]:
         print("=" * w)
-        print(f" {label}  (2025 season ratings + SOS)")
+        print(f" {label}  (2025 season ratings)")
         print("=" * w)
         print(f"{'Team':<24}" + "".join(f"{n:>15}" for n in names))
         print("-" * w)
 
         all_teams = set()
-        for name, _, _, _ in models_config:
+        for name, _, _ in models_config:
             top = sorted(mc_results[name][count_key].items(), key=lambda x: -x[1])[:15]
             all_teams.update(t for t, _ in top)
 
@@ -998,7 +632,7 @@ def print_summary_table(mc_results, id_to_name, models_config, n=N_SIMULATIONS):
         for tid in sorted_teams[:16]:
             team_name = id_to_name.get(tid, str(tid))[:23]
             row = f"{team_name:<24}"
-            for name, _, _, _ in models_config:
+            for name, _, _ in models_config:
                 pct = mc_results[name][count_key].get(tid, 0) / n * 100
                 row += f"{pct:>14.1f}%"
             print(row)
@@ -1006,87 +640,44 @@ def print_summary_table(mc_results, id_to_name, models_config, n=N_SIMULATIONS):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 11: Main Execution
+# SECTION 9: Main Execution
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     print("=" * 60)
     print("  🏀 March Madness ELO Bracket Predictor")
     print(f"  Calibration: {CALIBRATION_START}-{CALIBRATION_END} | Final ratings: {CURRENT_SEASON} only")
-    print(f"  SOS: in-game shrinkage (k={SOS_SHRINKAGE}, impact={SOS_IMPACT}) + post-proc (scale={SOS_SCALE})")
     print("=" * 60)
 
     teams_df, reg_df, tourney_df, seeds_df, conf_df = load_data()
     id_to_name = dict(zip(teams_df["TeamID"], teams_df["TeamName"]))
 
-    # ── Train all 3 models ────────────────────────────────────────────────────
-    print("Training models...")
-    print("  [1/3] Basic ELO (no SOS)...")
-    elos_v1, sos_v1 = train_basic_elo(reg_df, tourney_df)
+    # ── Train all 3 models (two-phase) ────────────────────────────────────────
+    print("Training models (Phase 1: calibration | Phase 2: 2025 season)...")
+    print("  [1/3] Basic ELO...")
+    elos_v1 = train_basic_elo(reg_df, tourney_df)
 
-    # Get tournament team IDs for SOS normalization — z-score is computed
-    # within the tourney field, not vs all 364 teams in the dataset
-    tourney_ids = seeds_df[seeds_df["Season"] == PREDICT_YEAR]["TeamID"].astype(int).tolist()
+    print("  [2/3] Enhanced ELO...")
+    elos_v2 = train_enhanced_elo(reg_df, tourney_df)
 
-    print("  [2/3] Enhanced ELO (with rolling SOS)...")
-    elos_v2_raw, sos_v2 = train_enhanced_elo(reg_df, tourney_df)
-    elos_v2 = apply_sos_adjustment(elos_v2_raw, sos_v2, tourney_ids)
-
-    print("  [3/3] Kitchen Sink ELO (with rolling SOS)...")
-    elos_v3_raw, sos_v3 = train_kitchen_sink_elo(reg_df, tourney_df, conf_df)
-    elos_v3_sos = apply_sos_adjustment(elos_v3_raw, sos_v3, tourney_ids)
-    elos_v3     = blend_seed_prior(elos_v3_sos, seeds_df, PREDICT_YEAR)
+    print("  [3/3] Kitchen Sink ELO...")
+    elos_v3_raw = train_kitchen_sink_elo(reg_df, tourney_df, conf_df)
+    elos_v3     = blend_seed_prior(elos_v3_raw, seeds_df, PREDICT_YEAR)
     print()
 
-    # ── Show SOS adjustment impact ────────────────────────────────────────────
-    print(f"  SOS post-processing adjustment (scale={SOS_SCALE} ELO pts per std dev):")
-    showcase = ["UC San Diego", "Auburn", "Duke", "Houston", "Alabama", "McNeese St", "Drake"]
-    print(f"    {'Team':<25} {'Raw ELO':>8}  {'SOS%':>6}  {'Adj':>6}  {'Final ELO':>9}")
-    print(f"    {'-'*58}")
-    for name in showcase:
-        tid = next((t for t, n in id_to_name.items() if n == name), None)
-        if tid and tid in sos_v2 and tid in elos_v2_raw:
-            raw  = elos_v2_raw[tid]
-            final = elos_v2[tid]
-            adj  = final - raw
-            sos  = sos_v2[tid]
-            print(f"    {name:<25} {raw:>8.1f}  {sos:>5.1f}%  {adj:>+6.1f}  {final:>9.1f}")
-    print()
-
-    # models_config: (name, elos, color, sos_scores)
     models_config = [
-        ("V1 Basic",        elos_v1, "#3b82f6", sos_v1),
-        ("V2 Enhanced",     elos_v2, "#22c55e", sos_v2),
-        ("V3 Kitchen Sink", elos_v3, "#d97706", sos_v3),
+        ("V1 Basic",        elos_v1, "#3b82f6"),
+        ("V2 Enhanced",     elos_v2, "#22c55e"),
+        ("V3 Kitchen Sink", elos_v3, "#d97706"),
     ]
 
-    # ── Sanity check: top 10 + SOS for key teams ──────────────────────────────
-    print("Top 10 ELO ratings by model (2025 season + SOS):")
-    for name, elos, _, sos_scores in models_config:
+    # ── Sanity check: top 10 per model ────────────────────────────────────────
+    print("Top 10 ELO ratings by model (2025 season only):")
+    for name, elos, _ in models_config:
         top10 = sorted(elos.items(), key=lambda x: -x[1])[:10]
         print(f"\n  {name}:")
-        print(f"    {'Rank':<5} {'Team':<25} {'ELO':>7}  {'SOS':>5}")
-        print(f"    {'-'*45}")
         for i, (tid, elo) in enumerate(top10, 1):
-            sos = sos_scores.get(tid, "N/A")
-            sos_str = f"{sos:.1f}%" if isinstance(sos, float) else sos
-            print(f"    {i:2d}.  {id_to_name.get(tid, tid):<25} {elo:>7.1f}  {sos_str:>6}")
-
-    # ── SOS impact: show how much UC San Diego moved ──────────────────────────
-    print("\n  SOS sanity check — high vs low SOS teams (V2):")
-    print(f"    {'Team':<25} {'ELO':>7}  {'SOS score':>10}")
-    print(f"    {'-'*45}")
-    tourney_teams_ids = seeds_df[seeds_df["Season"] == PREDICT_YEAR]["TeamID"].astype(int).tolist()
-    sos_sorted = sorted(
-        [(tid, elos_v2.get(tid, STARTING_ELO), sos_v2.get(tid, 50.0))
-         for tid in tourney_teams_ids if tid in sos_v2],
-        key=lambda x: -x[2]
-    )
-    for tid, elo, sos in sos_sorted[:5]:
-        print(f"    {id_to_name.get(tid, tid):<25} {elo:>7.1f}  {sos:>9.1f}%  ← highest SOS")
-    print("    ...")
-    for tid, elo, sos in sos_sorted[-5:]:
-        print(f"    {id_to_name.get(tid, tid):<25} {elo:>7.1f}  {sos:>9.1f}%  ← lowest SOS")
+            print(f"    {i:2d}. {id_to_name.get(tid, tid):<25} {elo:.1f}")
     print()
 
     # ── Parse bracket ─────────────────────────────────────────────────────────
@@ -1097,7 +688,7 @@ def main():
     # ── Monte Carlo ───────────────────────────────────────────────────────────
     mc_results = {}
     print(f"Running Monte Carlo simulations ({N_SIMULATIONS:,} × 3 models)...")
-    for name, elos, _, _ in models_config:
+    for name, elos, color in models_config:
         champ_det, _, _ = sim_bracket(bracket_2025, elos, deterministic=True)
         mc = run_monte_carlo(bracket_2025, elos, N_SIMULATIONS)
         mc_results[name] = mc
@@ -1112,26 +703,16 @@ def main():
 
     # ── Draw brackets ─────────────────────────────────────────────────────────
     print("Drawing brackets...")
-    for name, elos, color, _ in models_config:
+    for name, elos, color in models_config:
         _, results, _ = sim_bracket(bracket_2025, elos, deterministic=True)
         safe_name = name.lower().replace(" ", "_")
         draw_bracket(bracket_2025, elos, results, id_to_name, name, color,
                      f"bracket_{safe_name}.png")
 
-    # ── CSV exports ───────────────────────────────────────────────────────────
-    print("Exporting bracket CSVs...")
-    for name, elos, _, sos_scores in models_config:
-        safe_name = name.lower().replace(" ", "_")
-        export_bracket_csv(
-            bracket_2025, elos, id_to_name, name,
-            mc_results[name], sos_scores,
-            f"bracket_{safe_name}.csv",
-        )
-
     # ── Comparison charts ─────────────────────────────────────────────────────
     print("Generating comparison charts...")
     plot_championship_probs(mc_results, id_to_name, models_config)
-    plot_elo_distributions(tourney_teams, [e for _, e, _, _ in models_config], models_config)
+    plot_elo_distributions(tourney_teams, [e for _, e, _ in models_config], models_config)
     plot_model_correlation(tourney_teams, elos_v1, elos_v2, elos_v3)
 
     # ── Summary tables ────────────────────────────────────────────────────────
@@ -1140,9 +721,12 @@ def main():
 
     print("=" * 60)
     print("  ✅ Done! Files saved:")
-    print("     PNGs:  bracket_v1_basic / v2_enhanced / v3_kitchen_sink")
-    print("     PNGs:  championship_probs_comparison / elo_distributions / model_correlation")
-    print("     CSVs:  bracket_v1_basic / v2_enhanced / v3_kitchen_sink")
+    print("     bracket_v1_basic.png")
+    print("     bracket_v2_enhanced.png")
+    print("     bracket_v3_kitchen_sink.png")
+    print("     championship_probs_comparison.png")
+    print("     elo_distributions.png")
+    print("     model_correlation.png")
     print("=" * 60)
 
 
